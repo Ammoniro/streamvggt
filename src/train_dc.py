@@ -174,16 +174,6 @@ def train(args):
         for dataset in args.test_dataset.split("+")
     }
 
-    # model
-    printer.info("Loading model")
-    # model = StreamVGGT()
-    model = DepthStream(depth_condition="dino_2")
-    teacher = VGGT()
-
-    # model: PreTrainedModel = eval(args.model)
-    printer.info(f"All model parameters: {sum(p.numel() for p in model.parameters())}")
-
-
     printer.info(f">> Creating train criterion = {args.train_criterion}")
     train_criterion = eval(args.train_criterion).to(device)
     printer.info(
@@ -191,7 +181,39 @@ def train(args):
     )
     test_criterion = eval(args.test_criterion or args.criterion).to(device)
 
+    if args.use_teacher:
+        printer.info("Loading teacher model")
+        teacher = VGGT()
+        ckpt_teacher = torch.load(args.pretrained, map_location=device)
+        teacher.load_state_dict(ckpt_teacher, strict=True)
+        teacher = teacher.to(device)
+        for p in teacher.parameters():
+            p.requires_grad = False  
+        teacher.eval()
+        del ckpt_teacher
+    else:
+        teacher = None
+
+
+    # Loading depth-conditioned model.
+    if args.depth_condition:
+        from depth_anything_v2 import build_backbone
+        condition_model = build_backbone(
+            depth_size=args.condition_model_size, model_dir=args.condition_pretrained)
+
+        condition_model = condition_model.to(device)
+        condition_model.freeze_network({'encoder', 'decoder'})
+        condition_model = condition_model.eval()
+
+
+    # model
+    printer.info("Loading model")
+    # model = StreamVGGT()
+    model = DepthStream(depth_condition=args.depth_condition)
     model.to(device)
+
+    # model: PreTrainedModel = eval(args.model)
+    printer.info(f"All model parameters: {sum(p.numel() for p in model.parameters())}")
 
     if args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
@@ -205,16 +227,6 @@ def train(args):
             model.init_state_dict(ckpt, strict=True)
         )
         del ckpt  # in case it occupies memory
-
-    printer.info("Loading teacher model")
-    ckpt_teacher = torch.load(args.pretrained, map_location=device)
-    teacher.load_state_dict(ckpt_teacher, strict=True)
-    teacher = teacher.to("cuda")
-    for p in teacher.parameters():
-        p.requires_grad = False  
-    teacher.eval()
-    del ckpt_teacher
-
 
     # freeze
     printer.info("Freezing patch embedding and positional encoding parameters...")
@@ -251,7 +263,6 @@ def train(args):
     if frozen_param_names:
         printer.info(
             f"Example frozen parameters: {', '.join(frozen_param_names[:5])}{'...' if len(frozen_param_names) > 5 else ''}")
-
 
     # following timm: set wd as 0 for bias and norm layers
     param_groups = misc.get_parameter_groups(model, args.weight_decay)

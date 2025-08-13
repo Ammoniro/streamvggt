@@ -1330,6 +1330,7 @@ class DistillLoss(MultiLoss):
         # if len(preds) > 0 and 'camera_pose' in preds[0] and 'camera_pose' in gts[0]:
         cam_gt = torch.stack([g['camera_pose'] for g in gts], dim=1)
         cam_pr = torch.stack([p['camera_pose'] for p in preds], dim=1)
+        
         Lcamera = self.cam_loss(cam_pr, cam_gt)
 
         # ---------- Ldepth ----------

@@ -107,6 +107,7 @@ def loss_of_one_batch(
             output = model(batch, query_pts)
             preds, batch = output.ress, output.views
 
+        # Teacher inference.
         if teacher is not None:
             with torch.no_grad():
                 knowledge = teacher.inference(batch, query_pts)
@@ -117,10 +118,9 @@ def loss_of_one_batch(
         else:
             with torch.cuda.amp.autocast(enabled=False):
                 loss = criterion(batch, preds) if criterion is not None else None
-
+                
     result = dict(views=batch, pred=preds, loss=loss)
     return result[ret] if ret else result
-
 
 
 def check_if_same_size(pairs):

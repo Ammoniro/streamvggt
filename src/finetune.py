@@ -172,12 +172,6 @@ def train(args):
         for dataset in args.test_dataset.split("+")
     }
 
-    # model
-    printer.info("Loading model")
-    model = VGGT()
-
-    # model: PreTrainedModel = eval(args.model)
-    printer.info(f"All model parameters: {sum(p.numel() for p in model.parameters())}")
 
 
     printer.info(f">> Creating train criterion = {args.train_criterion}")
@@ -187,6 +181,12 @@ def train(args):
     )
     test_criterion = eval(args.test_criterion or args.criterion).to(device)
 
+    # model
+    printer.info("Loading model")
+    model = VGGT()
+
+    # model: PreTrainedModel = eval(args.model)
+    printer.info(f"All model parameters: {sum(p.numel() for p in model.parameters())}")
     model.to(device)
 
     if args.gradient_checkpointing:

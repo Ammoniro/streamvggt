@@ -1,5 +1,9 @@
 teacher: /data/chensiyu/pretrained/vggt/model.pt
 pretrained: /data/chensiyu/pretrained/vggt/model.pt
+condition_pretrained: /data/chensiyu/pretrained/depth-anything-v2/
+condition_model_size: "vitb"
+use_teacher: False
+depth_condition: "dino_2"
 load_only_encoder: False
 long_context: False
 fixed_length: True
