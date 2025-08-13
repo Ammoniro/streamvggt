@@ -55,7 +55,7 @@ from accelerate.logging import get_logger
 from datetime import timedelta
 import torch.multiprocessing
 
-from vggt.models.vggt import VGGT
+from depthstream.models.depthstream import DepthStream
 
 torch.multiprocessing.set_sharing_strategy("file_system")
 
@@ -172,8 +172,6 @@ def train(args):
         for dataset in args.test_dataset.split("+")
     }
 
-
-
     printer.info(f">> Creating train criterion = {args.train_criterion}")
     train_criterion = eval(args.train_criterion).to(device)
     printer.info(
@@ -181,9 +179,19 @@ def train(args):
     )
     test_criterion = eval(args.test_criterion or args.criterion).to(device)
 
+    # Loading depth-conditioned model.
+    if args.depth_condition:
+        from depth_anything_v2 import build_backbone
+        condition_model = build_backbone(
+            depth_size=args.condition_model_size, model_dir=args.condition_pretrained)
+
+        condition_model = condition_model.to(device)
+        condition_model.freeze_network({'encoder', 'decoder'})
+        condition_model = condition_model.eval()
+
     # model
     printer.info("Loading model")
-    model = VGGT()
+    model = DepthStream(depth_condition=args.depth_condition)
 
     # model: PreTrainedModel = eval(args.model)
     printer.info(f"All model parameters: {sum(p.numel() for p in model.parameters())}")
@@ -198,7 +206,7 @@ def train(args):
         printer.info(f"Loading pretrained: {args.pretrained}")
         ckpt = torch.load(args.pretrained, map_location=device)
         printer.info(
-            model.load_state_dict(ckpt, strict=True)
+            model.init_state_dict(ckpt, strict=True)
         )
         del ckpt  # in case it occupies memory
 
@@ -225,11 +233,8 @@ def train(args):
         model.aggregator.register_token.requires_grad = False
 
     model.camera_head.requires_grad = False
-    model.depth_head.requires_grad = False
+    model.point_head.requires_grad = False
     model.track_head.requires_grad = False
-
-    
-
 
     for name, p in model.named_parameters():
         if not p.requires_grad:

@@ -1290,6 +1290,64 @@ class DepthOrPmapLoss(nn.Module):
         # return main + reg
         return self.gamma * main_loss + grad_loss + reg_loss
 
+class MetricDepthLoss(nn.Module):
+    def __init__(self, alpha=0.01):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = 1.0 
+
+    def image_gradient_loss(self, pred, gt, mask):
+        assert pred.dim() == 4 and pred.shape[-1] == 1
+        assert gt.shape == pred.shape
+
+        B, H, W, _ = pred.shape
+        device = pred.device
+
+        dx_pred = pred[:, :, 1:] - pred[:, :, :-1]  # [B,H,W-1,1]
+        dx_gt = gt[:, :, 1:] - gt[:, :, :-1]
+        dx_mask = mask[:, :, 1:] & mask[:, :, :-1]  # [B,H,W-1]
+
+        dy_pred = pred[:, 1:, :] - pred[:, :-1, :]  # [B,H-1,W,1]
+        dy_gt = gt[:, 1:, :] - gt[:, :-1, :]
+        dy_mask = mask[:, 1:, :] & mask[:, :-1, :]  # [B,H-1,W]
+
+        min_h = min(dy_pred.shape[1], dx_pred.shape[1])
+        min_w = min(dx_pred.shape[2], dy_pred.shape[2])
+
+        dx_pred = dx_pred[:, :min_h, :min_w, :]  # [B,H-1,W-1,1]
+        dx_gt = dx_gt[:, :min_h, :min_w, :]
+        dx_mask = dx_mask[:, :min_h, :min_w]  # [B,H-1,W-1]
+
+        dy_pred = dy_pred[:, :min_h, :min_w, :]  # [B,H-1,W-1,1]
+        dy_gt = dy_gt[:, :min_h, :min_w, :]
+        dy_mask = dy_mask[:, :min_h, :min_w]  # [B,H-1,W-1]
+
+        loss_dx = F.l1_loss(dx_pred * dx_mask.unsqueeze(-1),
+                            dx_gt * dx_mask.unsqueeze(-1))
+        loss_dy = F.l1_loss(dy_pred * dy_mask.unsqueeze(-1),
+                            dy_gt * dy_mask.unsqueeze(-1))
+
+        return (loss_dx + loss_dy) / 2
+
+    def forward(self, pred, gt, sigma_p, sigma_g, valid_mask):
+        assert pred.shape[-1] == 1
+        assert gt.shape[-1] == 1
+
+        sigma_p = sigma_p.clamp(min=1e-6)
+        sigma_g = sigma_g.clamp(min=1e-6)
+        #sigma = 0.5 * (sigma_p + sigma_g)
+        sigma = sigma_p
+        diff = (pred - gt).abs()
+
+        C = diff.shape[-1]
+
+        main_loss = (sigma[..., None].expand(-1, -1, -1, C) * diff)[valid_mask[..., None].expand(-1, -1, -1, C)].mean()
+
+        grad_loss = self.image_gradient_loss(pred_aligned, gt_normalized, valid_mask)
+        reg_loss = -self.alpha * torch.log(sigma.clamp(min=1e-6))[valid_mask].mean()
+        # return main + reg
+        return self.gamma * main_loss + grad_loss + reg_loss
+
 class TrackLoss(nn.Module):
     def __init__(self):
         super().__init__()
@@ -1330,7 +1388,7 @@ class DistillLoss(MultiLoss):
         # if len(preds) > 0 and 'camera_pose' in preds[0] and 'camera_pose' in gts[0]:
         cam_gt = torch.stack([g['camera_pose'] for g in gts], dim=1)
         cam_pr = torch.stack([p['camera_pose'] for p in preds], dim=1)
-        
+
         Lcamera = self.cam_loss(cam_pr, cam_gt)
 
         # ---------- Ldepth ----------
