@@ -24,8 +24,6 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
         self.point_head = DPTHead(dim_in=2 * embed_dim, output_dim=4, activation="inv_log", conf_activation="expp1")
         self.depth_head = DPTHead(dim_in=2 * embed_dim, output_dim=2, activation="exp", conf_activation="expp1")
         self.track_head = TrackHead(dim_in=2 * embed_dim, patch_size=patch_size)
-    
-
 
     def forward(
         self,
@@ -96,13 +94,13 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
 
                     **({'track': predictions['track'][:, s],  # [B, N, 2]
                         'vis': predictions['vis'][:, s],  # [B, N]
-                        'track_conf': predictions['conf'][:, s]}
+                        'track_conf': predictions['conf'][:, s]} # [B, N]
                     if 'track' in predictions else {})
                 }
                 ress.append(res)
             return StreamVGGTOutput(ress=ress, views=views)  # [S] [B, C, H, W]
         
-    def inference(self, frames, query_points: torch.Tensor = None, past_key_values=None):        
+    def inference(self, frames, query_points: torch.Tensor = None, past_key_values=None):
         past_key_values = [None] * self.aggregator.depth
         past_key_values_camera = [None] * self.camera_head.trunk_depth
         
@@ -125,7 +123,9 @@ class StreamVGGT(nn.Module, PyTorchModelHubMixin):
             
             with torch.cuda.amp.autocast(enabled=False):
                 if self.camera_head is not None:
-                    pose_enc, past_key_values_camera = self.camera_head(aggregated_tokens, past_key_values_camera=past_key_values_camera, use_cache=True)
+                    pose_enc, past_key_values_camera = self.camera_head(
+                        aggregated_tokens, past_key_values_camera=past_key_values_camera, use_cache=True
+                    )
                     pose_enc = pose_enc[-1]
                     camera_pose = pose_enc[:, 0, :]
 

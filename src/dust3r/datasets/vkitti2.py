@@ -26,7 +26,7 @@ class VirtualKITTI2_Multi(BaseMultiViewDataset):
     def _load_data(self, split=None):
         scene_dirs = sorted(
             [
-                d
+                d 
                 for d in os.listdir(self.ROOT)
                 if os.path.isdir(os.path.join(self.ROOT, d))
             ]
@@ -44,7 +44,7 @@ class VirtualKITTI2_Multi(BaseMultiViewDataset):
                     if os.path.isdir(os.path.join(self.ROOT, scene, d))
                 ]
             )
-        offset = 0
+        offset = 0 # The number of images ahead of the current image.
         scenes = []
         sceneids = []
         images = []

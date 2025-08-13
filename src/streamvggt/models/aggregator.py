@@ -160,7 +160,6 @@ class Aggregator(nn.Module):
         Build the patch embed layer. If 'conv', we use a
         simple PatchEmbed conv layer. Otherwise, we use a vision transformer.
         """
-
         if "conv" in patch_embed:
             self.patch_embed = PatchEmbed(img_size=img_size, patch_size=patch_size, in_chans=3, embed_dim=embed_dim)
         else:

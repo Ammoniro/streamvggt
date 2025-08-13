@@ -1320,9 +1320,14 @@ class DistillLoss(MultiLoss):
 
     def get_name(self): return "DistillLoss"
 
-    def compute_loss(self, gts, preds,
-                     track_queries=None, track_preds=None):
+    def compute_loss(
+        self, 
+        gts, preds,
+        track_queries=None, 
+        track_preds=None
+    ):
         # ---------- Lcamera ----------
+        # if len(preds) > 0 and 'camera_pose' in preds[0] and 'camera_pose' in gts[0]:
         cam_gt = torch.stack([g['camera_pose'] for g in gts], dim=1)
         cam_pr = torch.stack([p['camera_pose'] for p in preds], dim=1)
         Lcamera = self.cam_loss(cam_pr, cam_gt)
@@ -1340,23 +1345,26 @@ class DistillLoss(MultiLoss):
         Ldepth = torch.stack(depth_terms).mean() if depth_terms else torch.zeros_like(Lcamera)
 
         # ---------- Lpmap ----------
-        pmap_terms = []
-        for g,p in zip(gts,preds):
-            sigma_p = p['conf']
-            sigma_g = g['conf']
-            valid_mask = g['valid_mask']
-            if not valid_mask.any():
-                valid_mask = torch.ones_like(g['valid_mask'])
-            pmap_terms.append(
-                self.pmap_loss(p['pts3d_in_other_view'],
-                               g['pts3d_in_other_view'],
-                               sigma_p,
-                               sigma_g,
-                               valid_mask))
-        Lpmap = torch.stack(pmap_terms).mean()
+        if len(preds) > 0 and 'pts3d_in_other_view' in preds[0] and 'pts3d_in_other_view' in gts[0]:
+            pmap_terms = []
+            for g,p in zip(gts,preds):
+                sigma_p = p['conf']
+                sigma_g = g['conf']
+                valid_mask = g['valid_mask']
+                if not valid_mask.any():
+                    valid_mask = torch.ones_like(g['valid_mask'])
+                pmap_terms.append(
+                    self.pmap_loss(p['pts3d_in_other_view'],
+                                g['pts3d_in_other_view'],
+                                sigma_p,
+                                sigma_g,
+                                valid_mask))
+            Lpmap = torch.stack(pmap_terms).mean()
+        else:
+            Lpmap = torch.zeros_like(Lcamera)
 
         # ---------- Ltrack ----------
-        if ('track' in gts[0]) and ('track' in preds[0]):
+        if len(preds) > 0 and ('track' in gts[0]) and ('track' in preds[0]):
             y_gt = torch.stack([g['track'] for g in gts], dim=1)
             vis_gt = torch.stack([g['vis'] for g in gts], dim=1)
 

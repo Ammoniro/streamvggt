@@ -9,6 +9,14 @@ import re
 import time
 
 def sample_query_points(mask, M):
+    """
+    ------------->x
+    |
+    |
+    |
+    |
+    y
+    """
     B, H, W = mask.shape
     yx = []
     for b in range(B):
