@@ -1329,12 +1329,12 @@ class MetricDepthLoss(nn.Module):
 
         return (loss_dx + loss_dy) / 2
 
-    def forward(self, pred, gt, sigma_p, sigma_g, valid_mask):
+    def forward(self, pred, gt, sigma_p, valid_mask):
         assert pred.shape[-1] == 1
         assert gt.shape[-1] == 1
 
         sigma_p = sigma_p.clamp(min=1e-6)
-        sigma_g = sigma_g.clamp(min=1e-6)
+        # sigma_g = sigma_g.clamp(min=1e-6)
         #sigma = 0.5 * (sigma_p + sigma_g)
         sigma = sigma_p
         diff = (pred - gt).abs()
@@ -1343,10 +1343,55 @@ class MetricDepthLoss(nn.Module):
 
         main_loss = (sigma[..., None].expand(-1, -1, -1, C) * diff)[valid_mask[..., None].expand(-1, -1, -1, C)].mean()
 
-        grad_loss = self.image_gradient_loss(pred_aligned, gt_normalized, valid_mask)
+        grad_loss = self.image_gradient_loss(pred, gt, valid_mask)
         reg_loss = -self.alpha * torch.log(sigma.clamp(min=1e-6))[valid_mask].mean()
         # return main + reg
         return self.gamma * main_loss + grad_loss + reg_loss
+
+class ConditionedDepthLoss(MultiLoss):
+    def __init__(self, mode='train'):
+        super().__init__()
+        self.depth_loss = MetricDepthLoss(alpha=0.1)
+        self.mode = mode
+
+    def compute_metrics(self, gt, pred):
+
+        thresh = torch.maximum((gt / pred), (pred / gt))
+        a1 = (thresh < 1.25).float().mean()
+
+        abs_rel = torch.mean(torch.abs(gt - pred) / gt)
+
+        rmse = (gt - pred) ** 2
+        rmse = torch.sqrt(rmse.mean())
+
+        return {k: v.item() for k, v in dict(a1=a1, abs_rel=abs_rel, rmse=rmse).items()}
+
+    def compute_loss(self, gts, preds):
+        # ---------- Ldepth ----------
+        depth_terms = []
+        for g,p in zip(gts, preds):
+            if ('depthmap' in g) and ('depth' in p):
+                sigma_p = p['depth_conf']
+                # sigma_g = g['depth_conf']
+                valid_mask = g['valid_mask']
+                if not valid_mask.any():
+                    valid_mask = torch.ones_like(g['valid_mask'])
+                depth_terms.append(self.depth_loss(p['depth'], g['depthmap'].unsqueeze(dim=-1), sigma_p, valid_mask))
+        Ldepth = torch.stack(depth_terms).mean() if depth_terms else torch.zeros_like(Lcamera)
+
+        total = Ldepth / 100
+        detail = {
+            'Ldepth': float(Ldepth) / 100
+        }
+
+        if self.mode == 'test':
+            gt_depths = torch.cat([g['depthmap'] for g in gts], dim=0)
+            pred_depths = torch.cat([p['depth'].squeeze(dim=-1) for p in preds], dim=0)
+            valid_masks = torch.cat([g['valid_mask'] for g in gts], dim=0)
+            metrics = self.compute_metrics(gt_depths[valid_masks], pred_depths[valid_masks])
+            detail.update(metrics)
+
+        return total, detail
 
 class TrackLoss(nn.Module):
     def __init__(self):

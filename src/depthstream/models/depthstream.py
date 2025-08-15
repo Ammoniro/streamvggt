@@ -39,18 +39,11 @@ class DepthStream(nn.Module, PyTorchModelHubMixin):
         else:
             condition_dict = None
         self.condition_dict = condition_dict
-    
 
-    def init_state_dict(
-        self, 
-        state_dict: Mapping[str, torch.Tensor], 
-        strict: bool = True
-    ):
-        missing, unexpected = super().load_state_dict(state_dict=state_dict, strict=strict)
-        
+    def construct_condition_model(self):
         if self.condition_dict is not None:
-            # del self.camera_head
-            # self.camera_head = None
+            del self.camera_head
+            self.camera_head = None
 
             del self.point_head
             self.point_head = None
@@ -130,11 +123,15 @@ class DepthStream(nn.Module, PyTorchModelHubMixin):
                 res = {
                     'depth': predictions['depth'][:, s],  # [B, H, W, 1]
                     'depth_conf': predictions['depth_conf'][:, s],  # [B, H, W]
-                    'camera_pose': predictions['pose_enc'][:, s, :],  # [B, 9]
                     
                     **({'valid_mask': views[s]["valid_mask"]}
                     if 'valid_mask' in views[s] else {}),  # [B, H, W]
                 }
+
+                if self.camera_head is not None:
+                    res.update({
+                        'camera_pose': predictions['pose_enc'][:, s, :],  # [B, 9]
+                    })
 
                 if self.point_head is not None:
                     res.update({

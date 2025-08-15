@@ -14,11 +14,12 @@ from dust3r.utils.image import imread_cv2
 
 class VirtualKITTI2_Multi(BaseMultiViewDataset):
 
-    def __init__(self, ROOT, *args, **kwargs):
+    def __init__(self, ROOT, depth_pattern, *args, **kwargs):
         self.ROOT = ROOT
         self.video = True
         self.is_metric = True
         self.max_interval = 5
+        self.depth_pattern = depth_pattern
         super().__init__(*args, **kwargs)
         # loading all
         self._load_data(self.split)
@@ -121,6 +122,7 @@ class VirtualKITTI2_Multi(BaseMultiViewDataset):
 
             img = basename + "_rgb.jpg"
             image = imread_cv2(osp.join(scene_dir, img))
+            
             depthmap = (
                 cv2.imread(
                     osp.join(scene_dir, basename + "_depth.png"),
@@ -139,6 +141,10 @@ class VirtualKITTI2_Multi(BaseMultiViewDataset):
             image, depthmap, intrinsics = self._crop_resize_if_necessary(
                 image, depthmap, intrinsics, resolution, rng, info=(scene_dir, img)
             )
+
+            depth_pattern_raw = self.depth_pattern
+            dep_sp, _, mask_sp = self.get_sparse_depth(
+                depthmap, depth_pattern_raw, match_density=True, rgb_np=np.asarray(image), input_noise="0~0.1")
 
             # generate img mask and raymap mask
             img_mask, ray_mask = self.get_img_and_ray_masks(
@@ -163,6 +169,8 @@ class VirtualKITTI2_Multi(BaseMultiViewDataset):
                     depth_only=False,
                     single_view=False,
                     reset=False,
+                    mask_sp=mask_sp,
+                    depth_sp=dep_sp,
                 )
             )
         assert len(views) == num_views

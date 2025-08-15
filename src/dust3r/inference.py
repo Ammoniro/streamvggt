@@ -84,6 +84,8 @@ def loss_of_one_batch(
     ret=None,
     img_mask=None,
     inference=False,
+    dino_cond=None,
+    norm_params=None,
 ):
     if len(batch) > 2:
         assert (
@@ -104,7 +106,12 @@ def loss_of_one_batch(
                 result = dict(views=batch, pred=preds)
                 return result[ret] if ret else result
         else:
-            output = model(batch, query_pts)
+            output = model(batch, query_pts, dino_cond=dino_cond)
+                    
+            with torch.no_grad():
+                if norm_params is not None:
+                    for ri, res in enumerate(output.ress):
+                        res['depth'] = res['depth'] * norm_params[0][ri:ri+1] + norm_params[1][ri:ri+1]
             preds, batch = output.ress, output.views
 
         # Teacher inference.

@@ -48,6 +48,8 @@ from tqdm import tqdm
 import random
 import builtins
 import shutil
+from PIL import Image
+
 
 from accelerate import Accelerator
 from accelerate import DistributedDataParallelKwargs, InitProcessGroupKwargs
@@ -61,6 +63,27 @@ torch.multiprocessing.set_sharing_strategy("file_system")
 
 printer = get_logger(__name__, log_level="DEBUG")
 
+def save_vis(arr, pth, is_normal=False, valid_mask=None, gt=None):
+    if valid_mask is not None:
+        valid_mask = valid_mask.squeeze()
+        arr[~valid_mask] = arr.min()
+    if gt is not None:
+        arr = (arr - gt.min()) / (gt.max() - gt.min())
+    elif is_normal:
+        arr = (arr - arr.min()) / (arr.max() - arr.min())
+
+    if isinstance(arr, torch.Tensor):
+        if arr.is_cuda:
+            arr = arr.detach().cpu()
+        arr = arr.numpy()
+
+    arr = np.clip(arr, a_min=0, a_max=1)
+    if arr.max() <= 1:
+        arr = arr * 255
+
+    arr = arr.astype(np.uint8)
+    img = Image.fromarray(arr)
+    img.save(pth)
 
 def setup_for_distributed(accelerator: Accelerator):
     """
@@ -171,6 +194,10 @@ def train(args):
         )
         for dataset in args.test_dataset.split("+")
     }
+    data_loader_test = {
+        k: accelerator.prepare(v) 
+        for k, v in data_loader_test.items()
+    }
 
     printer.info(f">> Creating train criterion = {args.train_criterion}")
     train_criterion = eval(args.train_criterion).to(device)
@@ -195,7 +222,6 @@ def train(args):
 
     # model: PreTrainedModel = eval(args.model)
     printer.info(f"All model parameters: {sum(p.numel() for p in model.parameters())}")
-    model.to(device)
 
     if args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
@@ -204,11 +230,13 @@ def train(args):
 
     if args.pretrained and not args.resume:
         printer.info(f"Loading pretrained: {args.pretrained}")
-        ckpt = torch.load(args.pretrained, map_location=device)
+        ckpt = torch.load(args.pretrained, map_location='cpu')
         printer.info(
-            model.init_state_dict(ckpt, strict=True)
+            model.load_state_dict(ckpt, strict=True)
         )
         del ckpt  # in case it occupies memory
+    model.construct_condition_model()
+    model.to(device)
 
     # freeze
     printer.info("Freezing patch embedding and positional encoding parameters...")
@@ -221,10 +249,10 @@ def train(args):
         total_params += param.numel()
         param.requires_grad = True
 
-    if hasattr(model, 'aggregator') and hasattr(model.aggregator, 'patch_embed'):
-        for param in model.aggregator.patch_embed.parameters():
-            if param.requires_grad:
-                param.requires_grad = False
+    # if hasattr(model, 'aggregator') and hasattr(model.aggregator, 'patch_embed'):
+    #     for param in model.aggregator.patch_embed.parameters():
+    #         if param.requires_grad:
+    #             param.requires_grad = False
 
     if hasattr(model, 'aggregator') and hasattr(model.aggregator, 'camera_token'):
         model.aggregator.camera_token.requires_grad = False
@@ -232,9 +260,13 @@ def train(args):
     if hasattr(model, 'aggregator') and hasattr(model.aggregator, 'register_token'):
         model.aggregator.register_token.requires_grad = False
 
-    model.camera_head.requires_grad = False
-    model.point_head.requires_grad = False
-    model.track_head.requires_grad = False
+    # We only finetune depth_head.
+    if hasattr(model, 'camera_head') and model.camera_head is not None:
+        model.camera_head.requires_grad = False
+    if hasattr(model, 'point_head') and model.point_head is not None:
+        model.point_head.requires_grad = False
+    if hasattr(model, 'track_head') and model.track_head is not None:
+        model.track_head.requires_grad = False
 
     for name, p in model.named_parameters():
         if not p.requires_grad:
@@ -248,8 +280,6 @@ def train(args):
     if frozen_param_names:
         printer.info(
             f"Example frozen parameters: {', '.join(frozen_param_names[:5])}{'...' if len(frozen_param_names) > 5 else ''}")
-
-
 
     # following timm: set wd as 0 for bias and norm layers
     param_groups = misc.get_parameter_groups(model, args.weight_decay)
@@ -321,29 +351,31 @@ def train(args):
                 save_model(epoch - 1, "last", best_so_far, args.start_step)
 
         new_best = False
-        # if epoch > 0 and args.eval_freq > 0 and epoch % args.eval_freq == 0:
-        #     test_stats = {}
-        #     for test_name, testset in data_loader_test.items():
-        #         stats = test_one_epoch(
-        #             model,
-        #             teacher,
-        #             test_criterion,
-        #             testset,
-        #             accelerator,
-        #             device,
-        #             epoch,
-        #             log_writer=log_writer,
-        #             args=args,
-        #             prefix=test_name,
-        #         )
-        #         test_stats[test_name] = stats
-        #
-        #         # Save best of all
-        #         if stats["loss_med"] < best_so_far:
-        #             best_so_far = stats["loss_med"]
-        #             new_best = True
-        # # Save more stuff
-        # write_log_stats(epoch, train_stats, test_stats)
+        if epoch > 0 and args.eval_freq > 0 and epoch % args.eval_freq == 0:
+            model = model.eval()
+            test_stats = {}
+            for test_name, testset in data_loader_test.items():
+                stats = test_one_epoch(
+                    model,
+                    test_criterion,
+                    testset,
+                    accelerator,
+                    device,
+                    log_writer=log_writer,
+                    args=args,
+                    prefix=test_name,
+                    epoch=epoch,
+                    condition_model=condition_model,
+                )
+                test_stats[test_name] = stats
+        
+                # Save best of all
+                if stats["abs_rel_avg"] < best_so_far:
+                    best_so_far = stats["abs_rel_avg"]
+                    new_best = True
+            model.train()
+        # Save more stuff
+        write_log_stats(epoch, train_stats, test_stats)
 
         if epoch > args.start_epoch:
             if args.keep_freq and epoch % args.keep_freq == 0:
@@ -364,7 +396,8 @@ def train(args):
             epoch,
             loss_scaler,
             log_writer=log_writer,
-            args=args
+            args=args,
+            condition_model=condition_model
         )
 
 
@@ -408,6 +441,60 @@ def build_dataset(dataset, batch_size, num_workers, accelerator, test=False, fix
     )
     return loader
 
+def least_square_align(pred, gt, valid_mask):
+    """
+    pred, gt:     (B, 1, H, W)   float
+    valid_mask:   (B, 1, H, W)   bool 或 0/1
+    返回:
+        scale: (B,)
+        shift: (B,)
+    """
+    assert pred.shape[1] == 1 and gt.shape[1] == 1
+    assert valid_mask.shape[1] == 1
+
+    B = pred.shape[0]
+    mask = valid_mask.to(pred.dtype)
+
+    # 有效像素数量 (B,1,1,1)
+    count = mask.sum(dim=(2, 3), keepdim=True).clamp(min=1)
+
+    # 有效像素均值
+    pred_mean = (pred * mask).sum(dim=(2, 3), keepdim=True) / count
+    gt_mean   = (gt   * mask).sum(dim=(2, 3), keepdim=True) / count
+
+    # 去均值并mask
+    xc = (pred - pred_mean) * mask
+    yc = (gt   - gt_mean)   * mask
+
+    numerator   = (xc * yc).sum(dim=(2, 3)).squeeze(1)                 # (B,)
+    denominator = (xc * xc).sum(dim=(2, 3)).clamp(min=1e-6).squeeze(1) # (B,)
+
+    scale = numerator / denominator
+    shift = gt_mean.view(B) - scale * pred_mean.view(B)
+
+    return scale, shift
+
+@torch.no_grad()
+def zero_one_normalize(depth_maps, valid_masks=None, affine_only=False):
+        
+        if valid_masks is not None:
+            masked_min = depth_maps.masked_fill(~valid_masks, float('inf')).min(dim=-1).values.min(dim=-1).values  # (B, 1)
+            masked_max = depth_maps.masked_fill(~valid_masks, float('-inf')).max(dim=-1).values.max(dim=-1).values  # (B, 1)
+        else:
+            masked_min = depth_maps.min(dim=-1).values.min(dim=-1).values  # (B, 1)
+            masked_max = depth_maps.max(dim=-1).values.max(dim=-1).values  # (B, 1)
+        
+        denom = masked_max - masked_min
+        denom = torch.where(denom == 0, torch.ones_like(denom), denom)
+        masked_min = masked_min.view(-1, 1, 1, 1)  # (B, 1, 1, 1)
+        denom = denom.view(-1, 1, 1, 1)
+        
+        if not affine_only:
+            normalized = (depth_maps - masked_min) / denom
+            return normalized, (masked_min, denom)
+        else:
+            return masked_min, denom
+
 
 def train_one_epoch(
     model: torch.nn.Module,
@@ -419,6 +506,7 @@ def train_one_epoch(
     loss_scaler,
     args,
     log_writer=None,
+    condition_model=None
 ):
     assert torch.backends.cuda.matmul.allow_tf32 == True
 
@@ -471,6 +559,49 @@ def train_one_epoch(
                 for view in batch:
                     view["img"] = (view["img"] + 1.0) / 2.0
 
+            if condition_model is not None:
+                dino_cond = []
+                condition_type = args.condition_type.split('+')
+            
+                # Now we consider realdepth-condition is necessary.
+                real_depth = torch.cat(
+                    [(batch[ii]["depth_sp"]) for ii in range(len(batch))], dim=0
+                ).to(torch.float32)
+
+                real_mask = torch.cat(
+                    [(batch[ii]["mask_sp"]) for ii in range(len(batch))], dim=0
+                ).to(torch.bool)
+
+                normed_real_depth, norm_params = zero_one_normalize(real_depth, real_mask, affine_only=False)
+
+                dino_cond.append(normed_real_depth)
+
+                if "dav2" in condition_type:
+                    assert "measure" in condition_type
+                    dav2_inputs = torch.cat(
+                        [(batch[ii]["img"] * 255) for ii in range(len(batch))], dim=0
+                    ).to(torch.uint8)
+
+                    # Infer.
+                    dav2_output = condition_model(dav2_inputs, input_size=518, device=accelerator.device)
+                    inv_dav2_output = disparity2depth(dav2_output)
+
+                    # Scale&shift predicted depth to the same scale as real depth.
+                    scale, shift = least_square_align(
+                        pred=inv_dav2_output,
+                        gt=real_depth,
+                        valid_mask=real_mask,
+                    )
+                    scale, shift = scale.view(-1, 1, 1, 1), shift.view(-1, 1, 1, 1)
+                    inv_dav2_output = inv_dav2_output * scale + shift
+
+                    # Normalize the dav2_output with the same scale as real depth.
+                    normed_inv_dav2_output = (inv_dav2_output - norm_params[1]) / norm_params[0]
+
+                    dino_cond.append(normed_inv_dav2_output)
+
+                dino_cond = torch.cat(dino_cond, dim=1)
+
             epoch_f = epoch + data_iter_step / len(data_loader)
             # we use a per iteration (instead of per epoch) lr scheduler
             if data_iter_step % accum_iter == 0:
@@ -487,6 +618,8 @@ def train_one_epoch(
                 inference=False,
                 symmetrize_batch=False,
                 use_amp=bool(args.amp),
+                dino_cond=dino_cond,
+                norm_params=norm_params,
             )
       
             loss, loss_details = result["loss"]  # criterion returns two values
@@ -593,7 +726,6 @@ def train_one_epoch(
 @torch.no_grad()
 def test_one_epoch(
     model: torch.nn.Module,
-    teacher: torch.nn.Module,
     criterion: torch.nn.Module,
     data_loader: Sized,
     accelerator: Accelerator,
@@ -602,6 +734,7 @@ def test_one_epoch(
     args,
     log_writer=None,
     prefix="test",
+    condition_model=None
 ):
 
     model.eval()
@@ -624,14 +757,58 @@ def test_one_epoch(
     for _, batch in enumerate(
         metric_logger.log_every(data_loader, args.print_freq, accelerator, header)
     ):
+        if condition_model is not None:
+            dino_cond = []
+            condition_type = args.condition_type.split('+')
+        
+            # Now we consider realdepth-condition is necessary.
+            real_depth = torch.cat(
+                [(batch[ii]["depth_sp"]) for ii in range(len(batch))], dim=0
+            ).to(torch.float32)
+
+            real_mask = torch.cat(
+                [(batch[ii]["mask_sp"]) for ii in range(len(batch))], dim=0
+            ).to(torch.bool)
+
+            normed_real_depth, norm_params = zero_one_normalize(real_depth, real_mask, affine_only=False)
+
+            dino_cond.append(normed_real_depth)
+
+            if "dav2" in condition_type:
+                assert "measure" in condition_type
+                dav2_inputs = torch.cat(
+                    [(batch[ii]["img"] * 255) for ii in range(len(batch))], dim=0
+                ).to(torch.uint8)
+
+                # Infer.
+                dav2_output = condition_model(dav2_inputs, input_size=518, device=accelerator.device)
+                inv_dav2_output = disparity2depth(dav2_output)
+
+                # Scale&shift predicted depth to the same scale as real depth.
+                scale, shift = least_square_align(
+                    pred=inv_dav2_output,
+                    gt=real_depth,
+                    valid_mask=real_mask,
+                )
+                scale, shift = scale.view(-1, 1, 1, 1), shift.view(-1, 1, 1, 1)
+                inv_dav2_output = inv_dav2_output * scale + shift
+
+                # Normalize the dav2_output with the same scale as real depth.
+                normed_inv_dav2_output = (inv_dav2_output - norm_params[1]) / norm_params[0]
+
+                dino_cond.append(normed_inv_dav2_output)
+
+            dino_cond = torch.cat(dino_cond, dim=1)
+
         result = loss_of_one_batch(
             batch,
             model,
             criterion,
             accelerator,
-            teacher=teacher,
             symmetrize_batch=False,
             use_amp=bool(args.amp),
+            dino_cond=dino_cond,
+            norm_params=norm_params,
         )
 
         loss_value, loss_details = result["loss"]  # criterion returns two values
@@ -653,26 +830,27 @@ def test_one_epoch(
                     continue
             if isinstance(val, dict):
                 continue
-            log_writer.add_scalar(prefix + "_" + name, val, 1000 * epoch)
+            log_writer.add_scalar(prefix + "_" + name, val, len(data_loader) * epoch)
 
 
-        depths_cross, gt_depths_cross = get_render_results(
-            batch, result["pred"], self_view=False
-        )
-        for k in range(len(batch)):
-            loss_details[f"pred_depth_{k+1}"] = depths_cross[k].detach().cpu()
-            loss_details[f"gt_depth_{k+1}"] = gt_depths_cross[k].detach().cpu()
+        ######## For point cloud.
+        # depths_cross, gt_depths_cross = get_render_results(
+        #     batch, result["pred"], self_view=False
+        # )
+        # for k in range(len(batch)):
+        #     loss_details[f"pred_depth_{k+1}"] = depths_cross[k].detach().cpu()
+        #     loss_details[f"gt_depth_{k+1}"] = gt_depths_cross[k].detach().cpu()
 
-        imgs_stacked_dict = get_vis_imgs_new(
-            loss_details,
-            args.num_imgs_vis,
-            args.num_test_views,
-            is_metric=batch[0]["is_metric"],
-        )
-        for name, imgs_stacked in imgs_stacked_dict.items():
-            log_writer.add_images(
-                prefix + "/" + name, imgs_stacked, 1000 * epoch, dataformats="HWC"
-            )
+        # imgs_stacked_dict = get_vis_imgs_new(
+        #     loss_details,
+        #     args.num_imgs_vis,
+        #     args.num_test_views,
+        #     is_metric=batch[0]["is_metric"],
+        # )
+        # for name, imgs_stacked in imgs_stacked_dict.items():
+        #     log_writer.add_images(
+        #         prefix + "/" + name, imgs_stacked, 1000 * epoch, dataformats="HWC"
+        #     )
 
     del loss_details, loss_value, batch
     torch.cuda.empty_cache()
@@ -769,6 +947,23 @@ def vis_and_cat(
     )
     return out
 
+# ******************** disparity space ********************
+# Adapted from Marigold, available at https://github.com/prs-eth/Marigold
+def depth2disparity(depth, return_mask=False):
+    if isinstance(depth, torch.Tensor):
+        disparity = torch.zeros_like(depth)
+    elif isinstance(depth, np.ndarray):
+        disparity = np.zeros_like(depth)
+    non_negtive_mask = depth > 0
+    disparity[non_negtive_mask] = 1.0 / depth[non_negtive_mask]
+    if return_mask:
+        return disparity, non_negtive_mask
+    else:
+        return disparity
+
+def disparity2depth(disparity, **kwargs):
+    return depth2disparity(disparity, **kwargs)
+# ************************* end ****************************
 
 def get_vis_imgs_new(loss_details, num_imgs_vis, num_views, is_metric):
     ret_dict = {}

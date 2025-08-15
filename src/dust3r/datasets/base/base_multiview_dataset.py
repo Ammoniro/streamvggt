@@ -3,12 +3,23 @@ import numpy as np
 import torch
 import random
 import itertools
+import cv2
+import torchvision.transforms as T
 from dust3r.datasets.base.easy_dataset import EasyDataset
 from dust3r.datasets.utils.transforms import ImgNorm, SeqColorJitter
 from dust3r.utils.geometry import depthmap_to_absolute_camera_coordinates
 import dust3r.datasets.utils.cropping as cropping
 from dust3r.datasets.utils.corr import extract_correspondences_from_pts3d
+from .NNfill import fill_in_fast
 
+PATTERN_IDS = {
+    'random': 0,
+    'velodyne': 1,
+    'sfm': 2,
+    'downscale': 3,
+    'cubic': 4,
+    "distance": 5
+}
 
 def get_ray_map(c2w1, c2w2, intrinsics, h, w):
     c2w = np.linalg.inv(c2w1) @ c2w2
@@ -21,6 +32,25 @@ def get_ray_map(c2w1, c2w2, intrinsics, h, w):
     ro = np.broadcast_to(ro, (h, w, 3))
     ray_map = np.concatenate([ro, rd], axis=-1)
     return ray_map
+
+def add_noise(dep, input_noise):
+    # add noise
+    # the noise can be "0.1" (fixed probablity) or "0.0~0.1" (uniform in the range)
+    if input_noise != "0.0":
+        if '~' in input_noise:
+            noise_prob_low, noise_prob_high = input_noise.split('~')
+            noise_prob_low, noise_prob_high = float(noise_prob_low), float(noise_prob_high)
+        else:
+            noise_prob_low, noise_prob_high = float(input_noise), float(input_noise)
+
+        noise_prob = np.random.uniform(noise_prob_low, noise_prob_high)
+        noise_mask = torch.tensor(np.random.binomial(n=1, p=noise_prob, size=dep.shape))
+        depth_min, depth_max = np.percentile(dep, 10), np.percentile(dep, 90)
+        noise_values = torch.tensor(np.random.uniform(depth_min, depth_max, size=dep.shape)).float()
+
+        dep[noise_mask == 1] = noise_values[noise_mask == 1]
+
+    return dep
 
 
 class BaseMultiViewDataset(EasyDataset):
@@ -400,6 +430,9 @@ class BaseMultiViewDataset(EasyDataset):
             view["pts3d"] = pts3d
             view["valid_mask"] = valid_mask & np.isfinite(pts3d).all(axis=-1)
 
+            view['mask_sp'] = view['mask_sp'].numpy().astype(bool) & view['valid_mask']
+            view['depth_sp'] = view['depth_sp'].numpy().astype(np.float32) * view['mask_sp']
+
             # check all datatypes
             for key, val in view.items():
                 res, err_msg = is_good_type(key, val)
@@ -493,6 +526,373 @@ class BaseMultiViewDataset(EasyDataset):
         )
 
         return image, depthmap, intrinsics2
+
+    class ToNumpy:
+        def __call__(self, sample):
+            return np.array(sample)
+
+    def get_sparse_depth(self, dep, pattern_raw, match_density=True, rgb_np=None, input_noise="0.0"):
+        if isinstance(dep, np.ndarray):
+            t_dep = T.Compose([
+                self.ToNumpy(),
+                T.ToTensor()
+            ])
+            dep = t_dep(dep).to(torch.float32)
+        dep = torch.clone(dep)
+
+        channel, height, width = dep.shape
+
+        assert channel == 1
+
+        idx_nnz = torch.nonzero(dep.view(-1) > 0.0001, as_tuple=False)
+        num_idx = len(idx_nnz)
+
+        # the patterns can have format "0.8*100~2000+0.2*sift"
+        all_weights = []
+        all_patterns = []
+        for pattern_item in pattern_raw.split('+'):
+            if '*' in pattern_item:
+                weight, pattern = pattern_item.split('*')
+            else:
+                weight, pattern = 1.0, pattern_item
+
+            all_weights.append(weight)
+            all_patterns.append(pattern)
+        pattern = np.random.choice(all_patterns, p=all_weights)
+        # further parse if needed
+        if '~' in pattern and "downscale" not in pattern and "cubic" not in pattern and "distance" not in pattern:
+            num_start, num_end = pattern.split('~')
+            num_start = int(num_start)
+            num_end = int(num_end)
+            pattern = str(np.random.randint(num_start, num_end))
+
+        if pattern.isdigit():
+            num_sample = int(pattern)
+
+            if match_density:
+                # we want a uniform density
+                num_sample_normalized = max(int(round(num_idx * num_sample / (height * width))), 5)
+                idx_sample = torch.randperm(num_idx)[:num_sample_normalized]
+            else:
+                idx_sample = torch.randperm(num_idx)[:num_sample]
+
+            idx_nnz = idx_nnz[idx_sample[:]]
+
+            mask = torch.zeros((channel * height * width))
+            mask[idx_nnz] = 1.0
+            mask = mask.view((channel, height, width))
+
+            dep = add_noise(dep, input_noise)
+            dep_sp = dep * mask.type_as(dep)
+            pattern_id = PATTERN_IDS['random']
+        
+        elif "distance" in pattern:
+            factor = pattern.split("distance")[-1]
+            
+            if '~' in factor:
+                dbegin, dend = factor.split('~')
+                r_left, r_right = int(dbegin), int(dend)
+            else:
+                factor = int(factor)
+                r_left, r_right = 1e-3, factor
+                
+            range_mask = torch.logical_and(
+                dep >= r_left, dep <= r_right
+            )
+            range_mask = torch.logical_and(
+                range_mask, dep > 1e-3
+            )
+            in_range = torch.nonzero(range_mask.view(-1) > 0.5, as_tuple=False)
+            num_in_range = len(in_range)
+            idx_sample = torch.randperm(num_in_range)[:2000]
+            in_range = in_range[idx_sample[:]]
+            mask = torch.zeros((channel * height * width))
+            mask[in_range] = 1.0
+            mask = mask.view((channel, height, width))
+            
+            dep_sp = dep * mask.type_as(dep)
+            pattern_id = PATTERN_IDS['distance']
+            
+        elif "downscale" in pattern:
+            factor = pattern.split("downscale")[-1]
+            
+            if '~' in factor:
+                sbegin, send = factor.split('~')
+                s_start, s_end = int(sbegin), int(send)
+                factor = np.random.randint(s_start, s_end)
+            else:
+                factor = int(factor)
+                
+            dep = add_noise(dep, input_noise)
+            # We first obtain the low-resolution picture.
+            h, w = dep.shape[-2:]
+            lh, lw = h // factor, w // factor
+            ldep = F.interpolate(dep.unsqueeze(0), size=(lh, lw), mode='bilinear', align_corners=True)
+            
+            # Obtain the coodinates of the sparse points.
+            sh, sw = h / lh, w / lw
+            ih, iw = (sh * torch.arange(lh)).long(), (sw * torch.arange(lw)).long()
+            
+            # We then obtain the sparse mask of the high-resolution image.
+            low_mask = torch.zeros_like(dep, dtype=torch.bool)
+            low_mask[..., ih[:, None], iw] = True
+            
+            # Fill in all low-resolution pixels to the higher-res one.
+            dep_sp = torch.zeros_like(dep, dtype=torch.float32)
+            dep_sp[low_mask] = ldep.flatten()
+            # Filter the sparse points with valid mask. 
+            mask = torch.torch.logical_and(low_mask, dep > 0.0001) # low-res valid mask.
+            
+            dep_sp = dep_sp * mask.type_as(dep_sp)
+            pattern_id = PATTERN_IDS['downscale']
+
+        elif pattern == "velodyne":
+            # sample a virtual baseline
+            #%#
+            train_depth_velodyne_random_baseline = True
+            if train_depth_velodyne_random_baseline:
+                baseline_horizontal = np.random.choice([1.0, -1.0]) * np.random.uniform(0.03, 0.06)
+                baseline_vertical = np.random.uniform(-0.02, 0.02)
+            else:
+                baseline_horizontal = 0.0
+                baseline_vertical = 0.0
+
+            # the target view canvas need to be slightly bigger
+            target_view_expand_factor = 1.5
+            height_expanded = int(target_view_expand_factor * height)
+            width_expanded = int(target_view_expand_factor * width)
+
+            # sample a virtual intrinsics
+            w_c = np.random.uniform(-0.5*width, 1.5*width)
+            h_c = np.random.uniform(0.5*height, 0.7*height)
+            # w_c = 0.5 * width
+            # h_c = 0.5 * height
+            focal = np.random.uniform(1.5*height, 2.0*height)
+            Km = np.eye(3)
+            Km[0, 0] = focal
+            Km[1, 1] = focal
+            Km[0, 2] = w_c
+            Km[1, 2] = h_c
+
+            Km_target = np.copy(Km)
+            Km_target[0, 2] += (target_view_expand_factor - 1.0) / 2.0 * width
+            Km_target[1, 2] += (target_view_expand_factor - 1.0) / 2.0 * height
+
+            dep_np = dep.numpy()
+
+            # unproject every depth to a virtual neighboring view
+            _, v, u = np.nonzero(dep_np)
+            z = dep_np[0, v, u]
+            points3D_source = np.linalg.inv(Km) @ (np.vstack([u, v, np.ones_like(u)]) * z) # 3 x N
+            points3D_target = np.copy(points3D_source)
+            points3D_target[0] -= baseline_horizontal # move in the x direction
+            points3D_target[1] -= baseline_vertical # move in the y direction
+
+            points2D_target = Km_target @ points3D_target
+            depth_target = points2D_target[2]
+            points2D_target = points2D_target[0:2] / (points2D_target[2:3] + 1e-8)  # 2 x N
+
+            # 2 x N_valid
+            points2D_target = np.round(points2D_target).astype(int)
+            points2D_target_valid = points2D_target[:, ((points2D_target[0] >= 0) & (points2D_target[0] < width_expanded) &
+                                                        (points2D_target[1] >= 0) & (points2D_target[1] < height_expanded))]
+
+            # N_valid
+            depth_target_valid = depth_target[((points2D_target[0] >= 0) & (points2D_target[0] < width_expanded) &
+                                                        (points2D_target[1] >= 0) & (points2D_target[1] < height_expanded))]
+
+            # take the min of all values
+            dep_map_target = np.full((height_expanded, width_expanded), np.inf)
+            np.minimum.at(dep_map_target, (points2D_target_valid[1], points2D_target_valid[0]), depth_target_valid)
+            dep_map_target[dep_map_target == np.inf] = 0.0
+
+            dep_map_target = fill_in_fast(dep_map_target, max_depth=np.max(dep_map_target))
+            dep_map_target = dep_map_target[None] # 1 x H x W
+
+            # mask out boundaries
+            # dep_map_target_mask = np.zeros_like(dep_map_target)
+            # dep_map_target_mask[:, (points2D_target_valid[1].min()):(points2D_target_valid[1].max()+1),
+            #         (points2D_target_valid[0].min()):(points2D_target_valid[0].max()+1)] = 1.0
+            # dep_map_target = dep_map_target * dep_map_target_mask
+
+            # return torch.tensor(dep_map_target).unsqueeze(0)
+
+            # sample the lidar patterns
+            pitch_max = np.random.uniform(0.25, 0.30)
+            pitch_min = np.random.uniform(-0.15, -0.20)
+            num_lines = np.random.randint(8, 64)
+            num_horizontal_points = np.random.randint(400, 1000)
+
+            tgt_pitch = np.linspace(pitch_min, pitch_max, num_lines)
+            tgt_yaw = np.linspace(-np.pi/2.1, np.pi/2.1, num_horizontal_points)
+
+            pitch_grid, yaw_grid = np.meshgrid(tgt_pitch, tgt_yaw)
+            y, x = np.sin(pitch_grid), np.cos(pitch_grid) * np.sin(yaw_grid) # assume the distace is unit
+            z = np.sqrt(1. - x**2 - y**2)
+            points_3D = np.stack([x, y, z], axis=0).reshape(3, -1) # 3 x (num_horizontal_points * num_lines)
+            points_2D = Km @ points_3D
+            points_2D = points_2D[0:2] / (points_2D[2:3] + 1e-8) # 2 x (num_horizontal_points * num_lines)
+
+            points_2D = np.round(points_2D).astype(int)
+            points_2D_valid = points_2D[:, ((points_2D[0]>=0) & (points_2D[0]<width_expanded) & (points_2D[1]>=0) & (points_2D[1]<height_expanded))]
+
+            mask = np.zeros([channel, height_expanded, width_expanded])
+            mask[:, points_2D_valid[1], points_2D_valid[0]] = 1.0
+
+            dep_map_target_sampled = dep_map_target * mask
+
+            # project it back to source
+            _, v, u = np.nonzero(dep_map_target_sampled)
+            if len(v) == 0:
+                return self.get_sparse_depth(dep, "1000", match_density=match_density, rgb_np=rgb_np, input_noise=input_noise)
+            
+            z = dep_map_target_sampled[0, v, u]
+            points3D_target = np.linalg.inv(Km_target) @ (np.vstack([u, v, np.ones_like(u)]) * z)  # 3 x N
+            points3D_source = np.copy(points3D_target)
+            points3D_source[0] += baseline_horizontal  # move in the x direction
+            points3D_source[1] += baseline_vertical  # move in the y direction
+
+            points2D_source = Km @ points3D_source
+            depth_source = points2D_source[2]
+            points2D_source = points2D_source[0:2] / (points2D_source[2:3] + 1e-8)  # 2 x N
+
+            # 2 x N_valid
+            points2D_source = np.round(points2D_source).astype(int)
+            points2D_source_valid = points2D_source[:, ((points2D_source[0] >= 0) & (points2D_source[0] < width) &
+                                                        (points2D_source[1] >= 0) & (points2D_source[1] < height))]
+
+            # N_valid
+            depth_source_valid = depth_source[((points2D_source[0] >= 0) & (points2D_source[0] < width) &
+                                                        (points2D_source[1] >= 0) & (points2D_source[1] < height))]
+
+            # take the min of all values
+            dep_map_source = np.full((height, width), np.inf)
+            np.minimum.at(dep_map_source, (points2D_source_valid[1], points2D_source_valid[0]), depth_source_valid)
+            dep_map_source[dep_map_source == np.inf] = 0.0
+            mask = np.zeros([channel, height, width])
+            mask[:, points2D_source_valid[1], points2D_source_valid[0]] = 1.0
+
+            # only keep the orginal valid regions
+            dep_map_source = dep_map_source * ((dep_np > 0.0).astype(float))
+
+            # only allow deeper value to appear in shallower region
+            dep_map_source[dep_map_source < dep_np] = 0.0
+
+            dep_sp = torch.tensor(dep_map_source).float()
+            pattern_id = PATTERN_IDS['velodyne']
+
+        elif pattern == "sift" or pattern == "orb":
+            assert rgb_np is not None
+            gray = cv2.cvtColor(rgb_np, cv2.COLOR_RGB2GRAY)
+
+            if pattern == "sift":
+                detector = cv2.SIFT.create()
+            elif pattern == "orb":
+                detector = cv2.ORB.create(nfeatures=100000, scoreType=cv2.ORB_FAST_SCORE)
+            else:
+                raise NotImplementedError
+
+            keypoints = detector.detect(gray)
+            mask = torch.zeros([1, height, width])
+
+            if len(keypoints) < 20:
+                return self.get_sparse_depth(dep, "1000", match_density=match_density, rgb_np=rgb_np, input_noise=input_noise)
+            
+            for keypoint in keypoints:
+                x = round(keypoint.pt[1])
+                y = round(keypoint.pt[0])
+                mask[:, x, y] = 1.0
+
+            #%#
+            train_sfm_max_dropout_rate = 0.0
+            if train_sfm_max_dropout_rate > 0.0:
+                keep_prob = 1.0 - np.random.uniform(0.0, train_sfm_max_dropout_rate)
+                mask_keep = keep_prob * torch.ones_like(mask)
+                mask_keep = torch.bernoulli(mask_keep)
+
+                mask = mask * mask_keep
+
+            dep = add_noise(dep, input_noise)
+            dep_sp = dep * mask.type_as(dep)
+            pattern_id = PATTERN_IDS['sfm']
+
+        elif pattern == "LiDAR_64" or pattern == "LiDAR_32" or pattern == "LiDAR_16" or pattern == "LiDAR_8":
+            baseline_horizontal = 0.0
+            baseline_vertical = 0.0
+
+            w_c = 0.5 * width
+            h_c = 0.5 * height
+            focal = height
+
+            Km = np.eye(3)
+            Km[0, 0] = focal
+            Km[1, 1] = focal
+            Km[0, 2] = w_c
+            Km[1, 2] = h_c
+
+            Km_target = np.copy(Km)
+
+            dep_np = dep.numpy()
+
+            # sample the lidar patterns
+            pitch_max = 0.5
+            pitch_min = -0.5
+            num_lines = int(pattern.split('_')[1])
+            num_horizontal_points = 200
+
+            tgt_pitch = np.linspace(pitch_min, pitch_max, num_lines)
+            tgt_yaw = np.linspace(-np.pi / 2.1, np.pi / 2.1, num_horizontal_points)
+
+            pitch_grid, yaw_grid = np.meshgrid(tgt_pitch, tgt_yaw)
+            y, x = np.sin(pitch_grid), np.cos(pitch_grid) * np.sin(yaw_grid)  # assume the distace is unit
+            z = np.sqrt(1. - x ** 2 - y ** 2)
+            points_3D = np.stack([x, y, z], axis=0).reshape(3, -1)  # 3 x (num_horizontal_points * num_lines)
+            points_2D = Km @ points_3D
+            points_2D = points_2D[0:2] / (points_2D[2:3] + 1e-8)  # 2 x (num_horizontal_points * num_lines)
+
+            points_2D = np.round(points_2D).astype(int)
+            points_2D_valid = points_2D[:, ((points_2D[0] >= 0) & (points_2D[0] < width) & (
+                        points_2D[1] >= 0) & (points_2D[1] < height))]
+
+            mask = np.zeros([channel, height, width])
+            mask[:, points_2D_valid[1], points_2D_valid[0]] = 1.0
+
+            dep_map_target_sampled = dep_np * mask
+
+            # only keep the orginal valid regions
+            dep_map_target_sampled = dep_map_target_sampled * ((dep_np > 0.0).astype(float))
+
+            dep_sp = torch.tensor(dep_map_target_sampled).float()
+            pattern_id = PATTERN_IDS['velodyne']
+            
+        elif 'cubic' in pattern:
+            factor = pattern.split("cubic")[-1]
+            
+            if '~' in factor:
+                sbegin, send = factor.split('~')
+                s_start, s_end = int(sbegin), int(send)
+                clen = np.random.randint(s_start, s_end)
+            else:
+                clen = int(factor)
+                
+            mask = torch.ones_like(dep, dtype=torch.bool)
+            H, W = mask.shape[-2:]
+            max_h, max_w = H - clen, W - clen
+            h = np.random.randint(0, max_h)
+            w = np.random.randint(0, max_w)
+            mask[:, h : h+clen, w : w+clen] = False
+            dep_sp = dep * mask.type_as(dep)
+            
+            pattern_id = PATTERN_IDS['cubic']
+            
+        else:
+            raise NotImplementedError
+
+        dep_sp = torch.nan_to_num(dep_sp)
+        if isinstance(mask, np.ndarray):
+            mask = torch.from_numpy(mask)
+
+        return dep_sp, torch.tensor(pattern_id), mask.to(torch.bool)
 
 
 def is_good_type(key, v):
